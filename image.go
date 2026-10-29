@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -207,6 +208,9 @@ type Image struct {
 	SecurityCnt   *uint32
 	MaxAlign      int
 	NonBootable   bool
+	SaveEncTLV    bool
+	EncKey        *Key
+	enctlvLen     int
 	VID, CID      string
 	BaseAddr      *uint32
 	Payload       []byte
@@ -300,6 +304,13 @@ func (im *Image) trailerSize() (int, error) {
 		return 0, fmt.Errorf("invalid alignment: %d", im.Align)
 	}
 	t := im.MaxSectors * 3 * im.Align
+	if im.EncKey != nil {
+		keyLen := 16
+		if im.SaveEncTLV {
+			keyLen = im.enctlvLen
+		}
+		t += alignUp(keyLen, im.MaxAlign) * 2 // encryption keys
+	}
 	t += im.MaxAlign * 4 // image_ok/copy_done/swap_info/swap_size
 	t += magicAlign
 	return t, nil
@@ -410,6 +421,10 @@ type CreateOpts struct {
 	UserSHA      string
 	Pure         bool
 	PadSig       bool
+	EncKey       *Key
+	EncKeyLen    int // 128 or 256
+	Clear        bool
+	HMACSHA      string
 }
 
 func resolveSHA(key *Key, user string, pure bool) (string, uint8, error) {
@@ -488,8 +503,21 @@ func (im *Image) Create(o CreateOpts) error {
 	}
 	protSize := prot.size()
 
-	im.addHeader(protSize)
-	im.Payload = append(im.Payload, prot.Bytes()...)
+	im.EncKey = o.EncKey
+	aes256 := o.EncKeyLen == 256
+	if o.EncKey != nil {
+		if err := checkEncKey(o.Key, o.EncKey); err != nil {
+			return err
+		}
+		if r := len(im.Payload) % 16; r > 0 {
+			im.Payload = append(im.Payload, make([]byte, 16-r)...)
+		}
+	}
+
+	im.addHeader(protSize, o.EncKey != nil, aes256)
+	protOff := len(im.Payload)
+	protBytes := prot.Bytes()
+	im.Payload = append(im.Payload, protBytes...)
 
 	tlv := &TLVArea{magic: tlvInfoMagic, order: e}
 	digest := digestOf(sha, im.Payload)
@@ -532,12 +560,43 @@ func (im *Image) Create(o CreateOpts) error {
 			return errors.New("can not sign using key and provide fixed-signature at the same time")
 		}
 	}
+	// The hash and signature cover the plaintext image and protected TLVs;
+	// the latter are re-added after encryption.
+	im.Payload = im.Payload[:protOff]
+
+	if o.EncKey != nil {
+		plain := make([]byte, o.EncKeyLen/8)
+		if _, err := rand.Read(plain); err != nil {
+			return err
+		}
+		typ, enc, err := encryptImageKey(o.EncKey, plain, o.HMACSHA)
+		if err != nil {
+			return err
+		}
+		im.enctlvLen = len(enc)
+		tlv.Add(typ, enc)
+		if !o.Clear {
+			ct, err := aesCTR(plain, im.Payload[im.HeaderSize:])
+			if err != nil {
+				return err
+			}
+			copy(im.Payload[im.HeaderSize:], ct)
+		}
+	}
+
+	im.Payload = append(im.Payload, protBytes...)
 	im.Payload = append(im.Payload, tlv.Bytes()...)
 	return im.checkTrailer()
 }
 
-func (im *Image) addHeader(protSize int) {
+func (im *Image) addHeader(protSize int, encrypted, aes256 bool) {
 	var flags uint32
+	if encrypted {
+		flags |= flagEncAES128
+		if aes256 {
+			flags = flagEncAES256
+		}
+	}
 	if im.LoadAddr != 0 {
 		flags |= flagRAMLoad
 	}

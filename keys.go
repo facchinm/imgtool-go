@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -27,16 +28,19 @@ const (
 	KindECDSA256
 	KindECDSA384
 	KindEd25519
+	KindX25519
 )
 
 // Key wraps a private or public key of one of the supported types.
 type Key struct {
 	Kind KeyKind
-	Priv crypto.Signer // nil for public-only keys
+	Priv crypto.Signer // nil for public-only and X25519 keys
 	Pub  crypto.PublicKey
+
+	ECDHPriv *ecdh.PrivateKey // X25519 private key
 }
 
-var keyTypes = []string{"rsa-2048", "rsa-3072", "ecdsa-p256", "ecdsa-p384", "ed25519"}
+var keyTypes = []string{"rsa-2048", "rsa-3072", "ecdsa-p256", "ecdsa-p384", "ed25519", "x25519"}
 
 func GenerateKey(typ string) (*Key, error) {
 	var s crypto.Signer
@@ -52,6 +56,12 @@ func GenerateKey(typ string) (*Key, error) {
 		s, err = ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	case "ed25519":
 		_, s, err = ed25519.GenerateKey(rand.Reader)
+	case "x25519":
+		p, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		return &Key{Kind: KindX25519, Pub: p.PublicKey(), ECDHPriv: p}, nil
 	default:
 		return nil, fmt.Errorf("unknown key type %q", typ)
 	}
@@ -80,6 +90,11 @@ func keyFrom(priv crypto.Signer, pub crypto.PublicKey) (*Key, error) {
 		}
 	case ed25519.PublicKey:
 		k.Kind = KindEd25519
+	case *ecdh.PublicKey:
+		if p.Curve() != ecdh.X25519() {
+			return nil, errors.New("unsupported ECDH curve")
+		}
+		k.Kind = KindX25519
 	default:
 		return nil, fmt.Errorf("unknown key type %T", pub)
 	}
@@ -103,6 +118,14 @@ func LoadKey(path string) (*Key, error) {
 			pk, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
 			if err != nil {
 				return nil, err
+			}
+			if xp, ok := pk.(*ecdh.PrivateKey); ok {
+				k, err := keyFrom(nil, xp.PublicKey())
+				if err != nil {
+					return nil, err
+				}
+				k.ECDHPriv = xp
+				return k, nil
 			}
 			s, ok := pk.(crypto.Signer)
 			if !ok {
@@ -140,7 +163,10 @@ func LoadKey(path string) (*Key, error) {
 	return nil, fmt.Errorf("%s: no supported PEM key found", path)
 }
 
-func (k *Key) HasPrivate() bool { return k.Priv != nil }
+func (k *Key) HasPrivate() bool { return k.Priv != nil || k.ECDHPriv != nil }
+
+// CanSign reports whether the key is a signing private key.
+func (k *Key) CanSign() bool { return k.Priv != nil }
 
 func (k *Key) rsaBits() int { return k.Pub.(*rsa.PublicKey).N.BitLen() }
 
@@ -152,6 +178,9 @@ func (k *Key) ShortName() string {
 		return "ecdsa"
 	case KindECDSA384:
 		return "ecdsap384"
+	}
+	if k.Kind == KindX25519 {
+		return "x25519"
 	}
 	return "ed25519"
 }
@@ -172,7 +201,11 @@ func (k *Key) PublicPEM() []byte {
 }
 
 func (k *Key) PrivatePEM() ([]byte, error) {
-	b, err := x509.MarshalPKCS8PrivateKey(k.Priv)
+	var priv any = k.Priv
+	if k.ECDHPriv != nil {
+		priv = k.ECDHPriv
+	}
+	b, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +283,8 @@ func (k *Key) ecdsaSHA() string {
 // Sign signs the full payload (RSA/ECDSA) or the digest (Ed25519, unless pure).
 func (k *Key) Sign(payload, digest []byte, pure, padSig bool) ([]byte, error) {
 	switch k.Kind {
+	case KindX25519:
+		return nil, errors.New("X25519 keys can not be used for signing")
 	case KindRSA:
 		d := sha256.Sum256(payload)
 		return rsa.SignPSS(rand.Reader, k.Priv.(*rsa.PrivateKey), crypto.SHA256, d[:],

@@ -27,6 +27,7 @@ Commands:
   create       alias of sign
   dumpinfo     Print header and TLV area information of a signed image
   getpub       Dump public key from keypair
+  getpriv      Dump private key from keypair
   getpubhash   Dump the SHA256 hash of the public key
   keygen       Generate pub/private keypair
   keyinfo      Print whether a key is private or public
@@ -43,7 +44,7 @@ func main() {
 	}
 	cmds := map[string]func([]string) error{
 		"keygen": cmdKeygen, "getpub": cmdGetpub, "getpubhash": cmdGetpubhash,
-		"keyinfo": cmdKeyinfo, "verify": cmdVerify, "sign": cmdSign, "create": cmdSign,
+		"keyinfo": cmdKeyinfo, "getpriv": cmdGetpriv, "verify": cmdVerify, "sign": cmdSign, "create": cmdSign,
 		"dumpinfo": cmdDumpinfo, "version": func([]string) error { fmt.Println(imgtoolVersion); return nil },
 	}
 	fn, ok := cmds[args[0]]
@@ -400,8 +401,12 @@ func cmdSign(args []string) error {
 	vector := str(fs, "", "vector-to-sign")
 	vid := str(fs, "", "vid")
 	cid := str(fs, "", "cid")
-	for _, unsupported := range []string{"E", "encrypt", "encrypt-keylen", "compression", "boot-record",
-		"c", "clear", "save-enctlv", "hmac-sha"} {
+	encrypt := str(fs, "", "E", "encrypt")
+	encKeyLen := str(fs, "128", "encrypt-keylen")
+	clear := boolean(fs, "c", "clear")
+	saveEncTLV := boolean(fs, "save-enctlv")
+	hmacSHA := str(fs, "auto", "hmac-sha")
+	for _, unsupported := range []string{"compression", "boot-record"} {
 		fs.Var(unsupportedFlag(unsupported), unsupported, "")
 	}
 
@@ -528,7 +533,7 @@ func cmdSign(args []string) error {
 		Version: ver, HeaderSize: int(hs), PadHeader: *padHeader, Pad: *pad, Confirm: *confirm,
 		Test: *test, Align: int(al), SlotSize: int(ss), MaxSectors: int(ms),
 		OverwriteOnly: *overwriteOnly, Order: order, LoadAddr: la, ROMFixed: rf,
-		ErasedVal: erasedVal, MaxAlign: int(ma), NonBootable: *nonBootable, VID: *vid, CID: *cid,
+		ErasedVal: erasedVal, MaxAlign: int(ma), SaveEncTLV: *saveEncTLV, NonBootable: *nonBootable, VID: *vid, CID: *cid,
 	})
 	if err != nil {
 		return usagef("%v", err)
@@ -551,11 +556,24 @@ func cmdSign(args []string) error {
 	}
 
 	co := CreateOpts{PubKeyFormat: *pkFormat, UserSHA: *userSHA, Pure: *pure, PadSig: *padSig, Vector: *vector}
+	if *encKeyLen != "128" && *encKeyLen != "256" {
+		return usagef("--encrypt-keylen must be 128 or 256")
+	}
+	if *hmacSHA != "auto" && *hmacSHA != "256" && *hmacSHA != "512" {
+		return usagef("--hmac-sha must be one of auto, 256, 512")
+	}
+	co.EncKeyLen, _ = strconv.Atoi(*encKeyLen)
+	co.Clear, co.HMACSHA = *clear, *hmacSHA
+	if *encrypt != "" {
+		if co.EncKey, err = LoadKey(*encrypt); err != nil {
+			return err
+		}
+	}
 	if *keyfile != "" {
 		if co.Key, err = LoadKey(*keyfile); err != nil {
 			return err
 		}
-		if !co.Key.HasPrivate() {
+		if !co.Key.CanSign() {
 			return usagef("Cannot sign with a public-only PEM; signing requires the private key.")
 		}
 	}
@@ -644,4 +662,33 @@ type unsupportedFlag string
 func (u unsupportedFlag) String() string { return "" }
 func (u unsupportedFlag) Set(string) error {
 	return usagef("option --%s is not supported by this Go implementation", string(u))
+}
+
+func cmdGetpriv(args []string) error {
+	fs := newFlags("getpriv")
+	keyfile := str(fs, "", "k", "key")
+	format := str(fs, "", "f", "format")
+	minimal := boolean(fs, "minimal")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if *keyfile == "" {
+		return usagef("getpriv requires -k/--key")
+	}
+	if *format != "" && *format != "openssl" && *format != "pkcs8" {
+		return usagef("invalid format %q (valid: openssl, pkcs8)", *format)
+	}
+	k, err := LoadKey(*keyfile)
+	if err != nil {
+		return err
+	}
+	if !k.HasPrivate() {
+		return usagef("operation get_private_bytes requires private key")
+	}
+	der, err := k.PrivateBytes(*minimal, *format)
+	if err != nil {
+		return usagef("%v", err)
+	}
+	return writeOut("", emitBytes("const unsigned char enc_priv_key[] = {", "};", der,
+		"const unsigned int enc_priv_key_len = %d;"))
 }
