@@ -101,8 +101,13 @@ func keyFrom(priv crypto.Signer, pub crypto.PublicKey) (*Key, error) {
 	return k, nil
 }
 
-// LoadKey reads a PEM private or public key.
-func LoadKey(path string) (*Key, error) {
+// LoadKey reads an unencrypted PEM private or public key. It returns
+// errPasswordRequired for password-protected keys.
+func LoadKey(path string) (*Key, error) { return LoadKeyPassword(path, nil) }
+
+// LoadKeyPassword reads a PEM key, decrypting it with password when it is
+// password-protected (PKCS#8 PBES2 or legacy OpenSSL "Proc-Type: 4,ENCRYPTED").
+func LoadKeyPassword(path string, password []byte) (*Key, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -112,6 +117,28 @@ func LoadKey(path string) (*Key, error) {
 		blk, raw = pem.Decode(raw)
 		if blk == nil {
 			break
+		}
+		//lint:ignore SA1019 legacy encrypted PEM is still accepted by upstream
+		if x509.IsEncryptedPEMBlock(blk) {
+			if password == nil {
+				return nil, errPasswordRequired
+			}
+			//lint:ignore SA1019 see above
+			der, err := x509.DecryptPEMBlock(blk, password)
+			if err != nil {
+				return nil, errBadPassword
+			}
+			blk = &pem.Block{Type: blk.Type, Bytes: der}
+		}
+		if blk.Type == "ENCRYPTED PRIVATE KEY" {
+			if password == nil {
+				return nil, errPasswordRequired
+			}
+			der, err := decryptPKCS8(blk.Bytes, password)
+			if err != nil {
+				return nil, err
+			}
+			blk = &pem.Block{Type: "PRIVATE KEY", Bytes: der}
 		}
 		switch blk.Type {
 		case "PRIVATE KEY":
@@ -156,8 +183,6 @@ func LoadKey(path string) (*Key, error) {
 				return nil, err
 			}
 			return keyFrom(nil, pub)
-		case "ENCRYPTED PRIVATE KEY":
-			return nil, errors.New("password-protected keys are not supported")
 		}
 	}
 	return nil, fmt.Errorf("%s: no supported PEM key found", path)
@@ -200,7 +225,8 @@ func (k *Key) PublicPEM() []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: b})
 }
 
-func (k *Key) PrivatePEM() ([]byte, error) {
+// PrivatePEM emits the private key as PKCS#8 PEM, encrypted when password is non-nil.
+func (k *Key) PrivatePEM(password []byte) ([]byte, error) {
 	var priv any = k.Priv
 	if k.ECDHPriv != nil {
 		priv = k.ECDHPriv
@@ -209,7 +235,13 @@ func (k *Key) PrivatePEM() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: b}), nil
+	if password == nil {
+		return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: b}), nil
+	}
+	if b, err = encryptPKCS8(b, password); err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: b}), nil
 }
 
 func (k *Key) SigTLV() uint8 {

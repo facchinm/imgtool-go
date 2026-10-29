@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -428,6 +430,7 @@ type CreateOpts struct {
 	EncKeyLen    int // 128 or 256
 	Clear        bool
 	HMACSHA      string
+	SwType       *string // boot record sw_type; nil means no boot record
 
 	// Used by the compression flow.
 	DontEncrypt      bool
@@ -489,6 +492,18 @@ func (im *Image) Create(o CreateOpts) error {
 		b := make([]byte, 4)
 		e.PutUint32(b, *im.SecurityCnt)
 		prot.Add(tlvSecCnt, b)
+	}
+	if o.SwType != nil {
+		if n := utf8.RuneCountInString(*o.SwType); n > maxSwTypeLength {
+			return fmt.Errorf("'%s' is too long (%d characters) for sw_type. Its maximum allowed length is %d characters", *o.SwType, n, maxSwTypeLength)
+		}
+		signerID := pubHash
+		if pub == nil {
+			signerID = make([]byte, sha256.Size)
+		}
+		ver := fmt.Sprintf("%d.%d.%d", im.Version.Major, im.Version.Minor, im.Version.Revision)
+		// The measurement is zero-filled; the bootloader inserts the real hash.
+		prot.Add(tlvBootRecord, bootRecordCBOR(*o.SwType, ver, signerID, tlvNames[uint16(hashTLV)], make([]byte, len(pubHash))))
 	}
 	for _, d := range o.Deps {
 		b := make([]byte, 12)
