@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -207,6 +208,11 @@ type Image struct {
 	SecurityCnt   *uint32
 	MaxAlign      int
 	NonBootable   bool
+	SaveEncTLV    bool
+	EncKey        *Key
+	enctlvLen     int
+	InFileData    []byte
+	ImageHash     []byte
 	VID, CID      string
 	BaseAddr      *uint32
 	Payload       []byte
@@ -263,7 +269,8 @@ func (im *Image) Load(path string) error {
 			return fmt.Errorf("input file not found: %w", err)
 		}
 	}
-	im.Payload = data
+	im.InFileData = data
+	im.Payload = append([]byte(nil), data...)
 	if im.PadHeader && im.HeaderSize > 0 {
 		if im.BaseAddr != nil && *im.BaseAddr != 0 {
 			b := *im.BaseAddr - uint32(im.HeaderSize)
@@ -300,6 +307,13 @@ func (im *Image) trailerSize() (int, error) {
 		return 0, fmt.Errorf("invalid alignment: %d", im.Align)
 	}
 	t := im.MaxSectors * 3 * im.Align
+	if im.EncKey != nil {
+		keyLen := 16
+		if im.SaveEncTLV {
+			keyLen = im.enctlvLen
+		}
+		t += alignUp(keyLen, im.MaxAlign) * 2 // encryption keys
+	}
 	t += im.MaxAlign * 4 // image_ok/copy_done/swap_info/swap_size
 	t += magicAlign
 	return t, nil
@@ -410,6 +424,22 @@ type CreateOpts struct {
 	UserSHA      string
 	Pure         bool
 	PadSig       bool
+	EncKey       *Key
+	EncKeyLen    int // 128 or 256
+	Clear        bool
+	HMACSHA      string
+
+	// Used by the compression flow.
+	DontEncrypt      bool
+	SkipTrailerCheck bool
+	CompTLVs         []rawTLV
+	KeepCompSize     bool
+	CompFlags        uint32
+}
+
+type rawTLV struct {
+	kind uint8
+	val  []byte
 }
 
 func resolveSHA(key *Key, user string, pure bool) (string, uint8, error) {
@@ -483,17 +513,43 @@ func (im *Image) Create(o CreateOpts) error {
 		}
 		prot.Add(tlvUUIDCID, cid)
 	}
+	comp := o.CompTLVs
+	if o.KeepCompSize {
+		b := make([]byte, 4)
+		e.PutUint32(b, uint32(im.ImageSize))
+		comp = append(append([]rawTLV(nil), comp...), rawTLV{tlvCompDecSize, b})
+	}
+	for _, c := range comp {
+		prot.Add(c.kind, c.val)
+	}
 	for _, c := range o.Custom {
 		prot.AddCustom(c.Tag, c.Value)
 	}
 	protSize := prot.size()
 
-	im.addHeader(protSize)
-	im.Payload = append(im.Payload, prot.Bytes()...)
+	im.EncKey = o.EncKey
+	aes256 := o.EncKeyLen == 256
+	encrypt := o.EncKey != nil && !o.DontEncrypt
+	if o.EncKey != nil {
+		if err := checkEncKey(o.Key, o.EncKey); err != nil {
+			return err
+		}
+	}
+	if encrypt {
+		if r := len(im.Payload) % 16; r > 0 {
+			im.Payload = append(im.Payload, make([]byte, 16-r)...)
+		}
+	}
+
+	im.addHeader(protSize, o.EncKey != nil, aes256, o.CompFlags)
+	protOff := len(im.Payload)
+	protBytes := prot.Bytes()
+	im.Payload = append(im.Payload, protBytes...)
 
 	tlv := &TLVArea{magic: tlvInfoMagic, order: e}
 	digest := digestOf(sha, im.Payload)
 	tlv.Add(hashTLV, digest)
+	im.ImageHash = digest
 	if o.Pure {
 		tlv.Add(tlvSigPure, []byte{1})
 	}
@@ -532,12 +588,47 @@ func (im *Image) Create(o CreateOpts) error {
 			return errors.New("can not sign using key and provide fixed-signature at the same time")
 		}
 	}
+	// The hash and signature cover the plaintext image and protected TLVs;
+	// the latter are re-added after encryption.
+	im.Payload = im.Payload[:protOff]
+
+	if encrypt {
+		plain := make([]byte, o.EncKeyLen/8)
+		if _, err := rand.Read(plain); err != nil {
+			return err
+		}
+		typ, enc, err := encryptImageKey(o.EncKey, plain, o.HMACSHA)
+		if err != nil {
+			return err
+		}
+		im.enctlvLen = len(enc)
+		tlv.Add(typ, enc)
+		if !o.Clear {
+			ct, err := aesCTR(plain, im.Payload[im.HeaderSize:])
+			if err != nil {
+				return err
+			}
+			copy(im.Payload[im.HeaderSize:], ct)
+		}
+	}
+
+	im.Payload = append(im.Payload, protBytes...)
 	im.Payload = append(im.Payload, tlv.Bytes()...)
+	if o.SkipTrailerCheck {
+		return nil
+	}
 	return im.checkTrailer()
 }
 
-func (im *Image) addHeader(protSize int) {
-	var flags uint32
+func (im *Image) addHeader(protSize int, encrypted, aes256 bool, compFlags uint32) {
+	flags := compFlags
+	if encrypted {
+		if aes256 {
+			flags |= flagEncAES256
+		} else {
+			flags |= flagEncAES128
+		}
+	}
 	if im.LoadAddr != 0 {
 		flags |= flagRAMLoad
 	}
