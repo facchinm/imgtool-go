@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -128,14 +129,17 @@ func cmdKeygen(args []string) error {
 	if *typ == "" || *keyfile == "" {
 		return usagef("keygen requires -t/--type (one of: %s) and -k/--key", strings.Join(keyTypes, ", "))
 	}
-	if *pw {
-		return usagef("password-protected keys are not supported")
-	}
 	k, err := GenerateKey(*typ)
 	if err != nil {
 		return usagef("%v", err)
 	}
-	pemBytes, err := k.PrivatePEM()
+	var password []byte
+	if *pw {
+		if password, err = newPassword(); err != nil {
+			return err
+		}
+	}
+	pemBytes, err := k.PrivatePEM(password)
 	if err != nil {
 		return err
 	}
@@ -176,7 +180,7 @@ func cmdGetpub(args []string) error {
 	if *suffix != "" && (*enc == "pem" || *enc == "raw") {
 		return usagef("`--name-suffix` is only meaningful for lang-c / lang-rust encodings")
 	}
-	k, err := LoadKey(*keyfile)
+	k, err := loadKey(*keyfile)
 	if err != nil {
 		return err
 	}
@@ -208,7 +212,7 @@ func cmdGetpubhash(args []string) error {
 	if !suffixRe.MatchString(*suffix) {
 		return usagef("%q must contain only [A-Za-z0-9_]", *suffix)
 	}
-	k, err := LoadKey(*keyfile)
+	k, err := loadKey(*keyfile)
 	if err != nil {
 		return err
 	}
@@ -232,6 +236,10 @@ func cmdKeyinfo(args []string) error {
 		return usagef("keyinfo requires -k/--key")
 	}
 	k, err := LoadKey(*keyfile)
+	if errors.Is(err, errPasswordRequired) {
+		return usagef("Cannot inspect %s: key is password-protected or unreadable. "+
+			"keyinfo runs non-interactively and does not prompt for a passphrase.", *keyfile)
+	}
 	if err != nil {
 		return err
 	}
@@ -258,7 +266,7 @@ func cmdVerify(args []string) error {
 	}
 	var key *Key
 	if *keyfile != "" {
-		if key, err = LoadKey(*keyfile); err != nil {
+		if key, err = loadKey(*keyfile); err != nil {
 			return err
 		}
 	}
@@ -304,26 +312,24 @@ func cmdDumpinfo(args []string) error {
 	if len(pos) != 1 {
 		return usagef("dumpinfo requires exactly one IMGFILE")
 	}
-	if *format == "" {
+	_ = silent // accepted for compatibility; ignored like upstream
+	switch {
+	case *format == "" && *outfile == "":
 		*format = "human"
+	case *format == "":
+		*format = "yaml"
+	case *format != "human" && *format != "json" && *format != "yaml":
+		return usagef("invalid format %q (human, yaml, json)", *format)
 	}
-	if *format != "human" && *format != "json" {
-		return usagef("unsupported format %q (human, json)", *format)
+	if *outfile == "" {
+		return DumpInfo(pos[0], *format, os.Stdout, true)
 	}
-	if !*silent {
-		if err := DumpInfo(pos[0], *format, os.Stdout); err != nil {
-			return err
-		}
+	f, err := os.Create(*outfile)
+	if err != nil {
+		return err
 	}
-	if *outfile != "" {
-		f, err := os.Create(*outfile)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		return DumpInfo(pos[0], *format, f)
-	}
-	return nil
+	defer f.Close()
+	return DumpInfo(pos[0], *format, f, false)
 }
 
 // multiTLV collects repeated two-argument options (--custom-tlv TAG VALUE).
@@ -409,9 +415,8 @@ func cmdSign(args []string) error {
 	saveEncTLV := boolean(fs, "save-enctlv")
 	hmacSHA := str(fs, "auto", "hmac-sha")
 	compression := str(fs, "disabled", "compression")
-	for _, unsupported := range []string{"boot-record"} {
-		fs.Var(unsupportedFlag(unsupported), unsupported, "")
-	}
+	var swType *string
+	fs.Func("boot-record", "", func(v string) error { swType = &v; return nil })
 
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
@@ -574,13 +579,14 @@ func cmdSign(args []string) error {
 	}
 	co.EncKeyLen, _ = strconv.Atoi(*encKeyLen)
 	co.Clear, co.HMACSHA = *clear, *hmacSHA
+	co.SwType = swType
 	if *encrypt != "" {
-		if co.EncKey, err = LoadKey(*encrypt); err != nil {
+		if co.EncKey, err = loadKey(*encrypt); err != nil {
 			return err
 		}
 	}
 	if *keyfile != "" {
-		if co.Key, err = LoadKey(*keyfile); err != nil {
+		if co.Key, err = loadKey(*keyfile); err != nil {
 			return err
 		}
 		if !co.Key.CanSign() {
@@ -646,7 +652,7 @@ func cmdSign(args []string) error {
 		if *fixSigPub == "" {
 			return usagef("public key of the fixed signature is not specified")
 		}
-		if co.PubKey, err = LoadKey(*fixSigPub); err != nil {
+		if co.PubKey, err = loadKey(*fixSigPub); err != nil {
 			return err
 		}
 	}
@@ -681,13 +687,6 @@ func cmdSign(args []string) error {
 	return nil
 }
 
-type unsupportedFlag string
-
-func (u unsupportedFlag) String() string { return "" }
-func (u unsupportedFlag) Set(string) error {
-	return usagef("option --%s is not supported by this Go implementation", string(u))
-}
-
 func cmdGetpriv(args []string) error {
 	fs := newFlags("getpriv")
 	keyfile := str(fs, "", "k", "key")
@@ -702,7 +701,7 @@ func cmdGetpriv(args []string) error {
 	if *format != "" && *format != "openssl" && *format != "pkcs8" {
 		return usagef("invalid format %q (valid: openssl, pkcs8)", *format)
 	}
-	k, err := LoadKey(*keyfile)
+	k, err := loadKey(*keyfile)
 	if err != nil {
 		return err
 	}

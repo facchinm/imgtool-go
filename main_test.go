@@ -18,7 +18,7 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pemBytes, _ := key.PrivatePEM()
+		pemBytes, _ := key.PrivatePEM(nil)
 		kf := filepath.Join(dir, typ+".pem")
 		os.WriteFile(kf, pemBytes, 0o600)
 		out := filepath.Join(dir, typ+".img")
@@ -59,7 +59,7 @@ func TestEncryptedImageFlagsAndTLV(t *testing.T) {
 	in := filepath.Join(dir, "app.bin")
 	os.WriteFile(in, make([]byte, 1001), 0o644)
 	sk, _ := GenerateKey("ed25519")
-	sp, _ := sk.PrivatePEM()
+	sp, _ := sk.PrivatePEM(nil)
 	skf := filepath.Join(dir, "sign.pem")
 	os.WriteFile(skf, sp, 0o600)
 	for typ, want := range map[string]byte{"x25519": tlvEncX25519, "rsa-2048": tlvEncRSA2048} {
