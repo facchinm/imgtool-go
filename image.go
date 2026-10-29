@@ -211,6 +211,8 @@ type Image struct {
 	SaveEncTLV    bool
 	EncKey        *Key
 	enctlvLen     int
+	InFileData    []byte
+	ImageHash     []byte
 	VID, CID      string
 	BaseAddr      *uint32
 	Payload       []byte
@@ -267,7 +269,8 @@ func (im *Image) Load(path string) error {
 			return fmt.Errorf("input file not found: %w", err)
 		}
 	}
-	im.Payload = data
+	im.InFileData = data
+	im.Payload = append([]byte(nil), data...)
 	if im.PadHeader && im.HeaderSize > 0 {
 		if im.BaseAddr != nil && *im.BaseAddr != 0 {
 			b := *im.BaseAddr - uint32(im.HeaderSize)
@@ -425,6 +428,18 @@ type CreateOpts struct {
 	EncKeyLen    int // 128 or 256
 	Clear        bool
 	HMACSHA      string
+
+	// Used by the compression flow.
+	DontEncrypt      bool
+	SkipTrailerCheck bool
+	CompTLVs         []rawTLV
+	KeepCompSize     bool
+	CompFlags        uint32
+}
+
+type rawTLV struct {
+	kind uint8
+	val  []byte
 }
 
 func resolveSHA(key *Key, user string, pure bool) (string, uint8, error) {
@@ -498,6 +513,15 @@ func (im *Image) Create(o CreateOpts) error {
 		}
 		prot.Add(tlvUUIDCID, cid)
 	}
+	comp := o.CompTLVs
+	if o.KeepCompSize {
+		b := make([]byte, 4)
+		e.PutUint32(b, uint32(im.ImageSize))
+		comp = append(append([]rawTLV(nil), comp...), rawTLV{tlvCompDecSize, b})
+	}
+	for _, c := range comp {
+		prot.Add(c.kind, c.val)
+	}
 	for _, c := range o.Custom {
 		prot.AddCustom(c.Tag, c.Value)
 	}
@@ -505,16 +529,19 @@ func (im *Image) Create(o CreateOpts) error {
 
 	im.EncKey = o.EncKey
 	aes256 := o.EncKeyLen == 256
+	encrypt := o.EncKey != nil && !o.DontEncrypt
 	if o.EncKey != nil {
 		if err := checkEncKey(o.Key, o.EncKey); err != nil {
 			return err
 		}
+	}
+	if encrypt {
 		if r := len(im.Payload) % 16; r > 0 {
 			im.Payload = append(im.Payload, make([]byte, 16-r)...)
 		}
 	}
 
-	im.addHeader(protSize, o.EncKey != nil, aes256)
+	im.addHeader(protSize, o.EncKey != nil, aes256, o.CompFlags)
 	protOff := len(im.Payload)
 	protBytes := prot.Bytes()
 	im.Payload = append(im.Payload, protBytes...)
@@ -522,6 +549,7 @@ func (im *Image) Create(o CreateOpts) error {
 	tlv := &TLVArea{magic: tlvInfoMagic, order: e}
 	digest := digestOf(sha, im.Payload)
 	tlv.Add(hashTLV, digest)
+	im.ImageHash = digest
 	if o.Pure {
 		tlv.Add(tlvSigPure, []byte{1})
 	}
@@ -564,7 +592,7 @@ func (im *Image) Create(o CreateOpts) error {
 	// the latter are re-added after encryption.
 	im.Payload = im.Payload[:protOff]
 
-	if o.EncKey != nil {
+	if encrypt {
 		plain := make([]byte, o.EncKeyLen/8)
 		if _, err := rand.Read(plain); err != nil {
 			return err
@@ -586,15 +614,19 @@ func (im *Image) Create(o CreateOpts) error {
 
 	im.Payload = append(im.Payload, protBytes...)
 	im.Payload = append(im.Payload, tlv.Bytes()...)
+	if o.SkipTrailerCheck {
+		return nil
+	}
 	return im.checkTrailer()
 }
 
-func (im *Image) addHeader(protSize int, encrypted, aes256 bool) {
-	var flags uint32
+func (im *Image) addHeader(protSize int, encrypted, aes256 bool, compFlags uint32) {
+	flags := compFlags
 	if encrypted {
-		flags |= flagEncAES128
 		if aes256 {
-			flags = flagEncAES256
+			flags |= flagEncAES256
+		} else {
+			flags |= flagEncAES128
 		}
 	}
 	if im.LoadAddr != 0 {

@@ -107,6 +107,8 @@ func boolean(fs *flag.FlagSet, names ...string) *bool {
 	return p
 }
 
+func logf(f string, a ...any) { fmt.Printf(f, a...) }
+
 func writeOut(path, content string) error {
 	if path == "" {
 		_, err := io.WriteString(os.Stdout, content)
@@ -406,7 +408,8 @@ func cmdSign(args []string) error {
 	clear := boolean(fs, "c", "clear")
 	saveEncTLV := boolean(fs, "save-enctlv")
 	hmacSHA := str(fs, "auto", "hmac-sha")
-	for _, unsupported := range []string{"compression", "boot-record"} {
+	compression := str(fs, "disabled", "compression")
+	for _, unsupported := range []string{"boot-record"} {
 		fs.Var(unsupportedFlag(unsupported), unsupported, "")
 	}
 
@@ -529,30 +532,37 @@ func cmdSign(args []string) error {
 		*pad = true
 	}
 
-	im, err := NewImage(&Image{
-		Version: ver, HeaderSize: int(hs), PadHeader: *padHeader, Pad: *pad, Confirm: *confirm,
-		Test: *test, Align: int(al), SlotSize: int(ss), MaxSectors: int(ms),
-		OverwriteOnly: *overwriteOnly, Order: order, LoadAddr: la, ROMFixed: rf,
-		ErasedVal: erasedVal, MaxAlign: int(ma), SaveEncTLV: *saveEncTLV, NonBootable: *nonBootable, VID: *vid, CID: *cid,
-	})
-	if err != nil {
-		return usagef("%v", err)
-	}
+	var secCntVal *uint32
 	switch strings.ToLower(*secCnt) {
 	case "":
 	case "auto":
 		v := uint32(ver.Major)<<24 + uint32(ver.Minor)<<16 + uint32(ver.Revision)
-		im.SecurityCnt = &v
+		secCntVal = &v
 	default:
 		n, err := strconv.ParseUint(*secCnt, 0, 32)
 		if err != nil {
 			return usagef("%s is not a valid integer for --security-counter", *secCnt)
 		}
 		v := uint32(n)
-		im.SecurityCnt = &v
+		secCntVal = &v
 	}
-	if err := im.Load(infile); err != nil {
-		return usagef("%v", err)
+	newImg := func() (*Image, error) {
+		im, err := NewImage(&Image{
+			Version: ver, HeaderSize: int(hs), PadHeader: *padHeader, Pad: *pad, Confirm: *confirm,
+			Test: *test, Align: int(al), SlotSize: int(ss), MaxSectors: int(ms),
+			OverwriteOnly: *overwriteOnly, Order: order, LoadAddr: la, ROMFixed: rf,
+			ErasedVal: erasedVal, MaxAlign: int(ma), SaveEncTLV: *saveEncTLV, NonBootable: *nonBootable,
+			VID: *vid, CID: *cid, SecurityCnt: secCntVal,
+		})
+		if err != nil {
+			return nil, usagef("%v", err)
+		}
+		return im, nil
+	}
+	switch *compression {
+	case "disabled", "lzma2", "lzma2armthumb":
+	default:
+		return usagef("--compression must be one of disabled, lzma2, lzma2armthumb")
 	}
 
 	co := CreateOpts{PubKeyFormat: *pkFormat, UserSHA: *userSHA, Pure: *pure, PadSig: *padSig, Vector: *vector}
@@ -641,8 +651,22 @@ func cmdSign(args []string) error {
 		}
 	}
 
-	if err := im.Create(co); err != nil {
-		return usagef("%v", err)
+	var im *Image
+	if *compression != "disabled" {
+		if im, err = BuildCompressed(newImg, infile, *compression, co); err != nil {
+			return usagef("%v", err)
+		}
+	}
+	if im == nil { // no compression requested, or it did not shrink the image
+		if im, err = newImg(); err != nil {
+			return err
+		}
+		if err := im.Load(infile); err != nil {
+			return usagef("%v", err)
+		}
+		if err := im.Create(co); err != nil {
+			return usagef("%v", err)
+		}
 	}
 	var hexp *uint32
 	if haSet {
